@@ -2,6 +2,18 @@
 name = "nrf24radio"
 version = "0.1.0"
 edition = "2021"
+authors = ["<agrc14@gmail.com>"]
+
+description = "Asynchronous embedded driver for NRF24L01(+) devices"
+
+readme = "README.md"
+
+repository = "https://github.com/micro-rust/nrf24radio"
+
+license = "MPL-2.0"
+
+keywords = ["embedded", "radio", "async", "driver", "nrf24", "no-std"]
+categories = ["asynchronous", "embedded", "no-std"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
