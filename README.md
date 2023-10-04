@@ -51,9 +51,16 @@ async fn send(mut pipe: TXDataPipe) {
 }
 ```
 
+## WIP
+
+ * Better control over TX and RX0 configuration
+ * Change TX address dynamically
+ * Change RF channels dynamically
+ * Noise detection 
+
 ## License and Contributing
 
 This library and its examples are licensed under
- · Mozilla Public License 2.0 [LICENSE-MPL](LICENSE-MPL)
+ * Mozilla Public License 2.0 [LICENSE-MPL](LICENSE-MPL)
 
 Contributions to this project will fall under the same license as defined above.
