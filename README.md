@@ -14,7 +14,17 @@ To add this library to your project simple execute the `cargo` command
 
 The drivers are split into two main abstractions: driver handle and data pipes. This split decouples the driver logic from the data transmission logic, simplifying the development process.
 
-Please see our showcase examples [here](./examples/). Shown in these examples are various possible usages of this library. To run an example navigate to the folder of the MCU you are using (e.g. `rp` for RP2040) and run the command `cargo run --release --bin <example>` to run the example with `probe-run` or `cargo build --release --bin <example>` to build it and the run it with your runner of choice.
+Please see our showcase examples [here](./examples/) for some common use cases of this library.
+
+To run an example navigate to the folder of the MCU you are using (e.g. `rp` for RP2040) and run the command
+
+`cargo run --release --bin <example>`
+
+to run the example using `probe-run` or
+
+`cargo build --release --bin <example>`
+
+to build it and the run it with your runner of choice.
 
 ### Driver handles
 
