@@ -74,6 +74,7 @@ pub struct Driver<SPI, CE, IRQ> {
     state: State,
 
     /// Current configuration of the device.
+    #[allow(dead_code)]
     config: Config,
 
     /// References to the RX pipes' buffers.
