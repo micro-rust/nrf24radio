@@ -1,0 +1,26 @@
+[package]
+name = "nrf24radio"
+version = "0.1.0-alpha.1"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+
+[dependencies.embedded-hal]
+version = "^1.0.0-rc.1"
+
+[dependencies.embedded-hal-async]
+version = "^1.0.0-rc.1"
+
+[dependencies.defmt]
+optional = true
+version = "*"
+
+
+
+[features]
+
+default = ["log"]
+
+log = ["defmt"]
