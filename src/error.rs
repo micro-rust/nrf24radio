@@ -32,6 +32,9 @@ pub enum Error {
     /// Failed to upload a new payload to the device.
     FailedPacketUpload,
 
+    /// Failed to modify a register.
+    FailedRegisterWrite,
+
     /// The given pipe number is not allowed.
     IllegalPipeNumber( u8 ),
 
@@ -46,6 +49,9 @@ pub enum Error {
 
     /// The pipe is currently in use.
     PipeCurrentlyUsed,
+
+    /// The pipe is not available.
+    PipeNotAvailable,
 
     /// The device's RX FIFO has received more than 52 bytes.
     RXOverflow,

@@ -242,7 +242,7 @@ impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
         defmt::trace!("RX Driver : Pipe number validated");
 
         // Check if the pipe is already open.
-        if self.rxpipes[n as usize].open() { return Err( ( Error::PipeCurrentlyUsed, None ) ) }
+        if self.rxpipes[n as usize].open() { return Err( ( Error::PipeNotAvailable, None ) ) }
 
         #[cfg(feature = "log")]
         defmt::trace!("RX Driver : Pipe {} is open", n);
@@ -640,10 +640,115 @@ impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
 }
 
 
-
 /// Intermediate methods for interacting with NRF24L01(+) devices.
 /// Reading specific registers, complex commands and routine interactions.
 impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
+    /// Sets the retries configuration of the device.
+    /// Please see the `TXConfig` struct for reference of the fields of this method.
+    /// WARNING : After changing the configuration the device will be in standby mode.
+    pub async fn retries(&mut self, retries: u8, delay: u8) -> Result<pipe::TXConfig, Self::Error> {
+        use pipe::TXConfig;
+
+        // Validate the values.
+        let r = if retries > 14 { 15 } else { retries };
+        let d = if delay == 0 { 0 } else if delay > 15 { 15 } else { delay - 1 };
+
+        // Create the register value to write.
+        let v = (d << 4) | (r & 0xF);
+
+        // Write the register.
+        if let Err( hwe ) = self.writereg(Register::SetupRetries, v).await {
+            return Err( (Error::FailedRegisterWrite, Some(hwe)) )
+        }
+
+        Ok( TXConfig { retries, delay, } )
+    }
+
+    /// Sets the RF channel used by the device.
+    /// The channel will be validated against the valid values. The method
+    /// returns the channel that was actually set.
+    /// WARNING : After changing channel the device will be in standby mode.
+    pub async fn setchannel(&mut self, ch: u8) -> Result<u8, Self::Error> {
+        // Write to the register.
+        if let Err( hwe ) = self.writereg(Register::RFChannel, ch & 0x7F).await {
+            return Err( (Error::FailedRegisterWrite, Some(hwe)) )
+        }
+
+        // Modify the configuration.
+        self.config.ch = ch & 0x7F;
+
+        Ok( ch & 0x7F )
+    }
+
+    /// Sets the Least Significant Byte of the address for the given pipe.
+    /// WARNING : After changing address the device will be in standby mode.
+    pub async fn subaddr(&mut self, pipe: u8, lsb: u8) -> Result<(), Self::Error> {
+        // Set in standby.
+        self.standby().await?;
+
+        // Check that the pipe number is valid.
+        if (pipe < 2) || (pipe > 5) { return Err( (Error::IllegalPipeNumber(pipe), None) ) }
+
+        // Write the register.
+        if let Err( hwe ) = self.writereg(Register::RX0Address as u8 + pipe, lsb).await {
+            return Err( (Error::FailedRegisterWrite, Some(hwe)) )
+        }
+
+        // Modify the configuration.
+        self.config.sub[pipe as usize - 1] = lsb;
+
+        Ok( () )
+    }
+
+    /// Sets the base address for Pipes 1-5 and the Least Significant Byte for Pipe 1.
+    /// WARNING : After changing address the device will be in standby mode.
+    pub async fn baseaddr(&mut self, addr: [u8; 5]) -> Result<(), Self::Error> {
+        // Set in standby.
+        self.standby().await?;
+
+        // Create the buffer to send.
+        let buf = [(1 << 5) | Register::RX1Address as u8, addr[0], addr[1], addr[2], addr[3], addr[4]];
+
+        // Send the buffer.
+        if let Err( hwe ) = self.writebuf(&buf).await {
+            return Err( (Error::FailedRegisterWrite, Some(hwe)) )
+        }
+
+        // Modify the configuration.
+        self.config.base = [addr[0], addr[1], addr[2], addr[3]];
+        self.config.sub[0] = addr[4];
+
+        Ok( () )
+    }
+
+    /// Sets the main address for Pipe 0 and the TX Pipe.
+    /// WARNING : After changing address the device will be in standby mode.
+    pub async fn mainaddr(&mut self, addr: [u8; 5]) -> Result<(), Self::Error> {
+        // Set in standby.
+        self.standby().await?;
+
+        // Create the buffer to send.
+        let mut buf = [(1 << 5) | Register::RX0Address as u8, addr[0], addr[1], addr[2], addr[3], addr[4]];
+
+        // Send the buffer.
+        if let Err( hwe ) = self.writebuf(&buf).await {
+            return Err( (Error::FailedRegisterWrite, Some(hwe)) )
+        }
+
+        // Change to write to the TX address register.
+        buf[0] = (1 << 5) | Register::TXAddress as u8;
+
+        // Send the buffer.
+        if let Err( hwe ) = self.writebuf(&buf).await {
+            return Err( (Error::FailedRegisterWrite, Some(hwe)) )
+        }
+
+        // Modify the configuration.
+        self.config.main = addr;
+
+        Ok( () )
+    }
+
     /// Clears the given IRQs from the status register.
     pub async fn clearirq(&mut self, rxdr: bool, txds: bool, retries: bool) -> Result<(), HardwareError<SPI::Error, CE::Error, IRQ::Error>> {
         // Build the IRQ clear byte.
@@ -892,7 +997,6 @@ impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
 }
 
 
-
 /// Basic methods for interacting with the NRF24 device.
 /// Writing and reading buffers / commands / registers through SPI.
 impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
@@ -930,7 +1034,6 @@ impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
         self.spi.write(&[c.into()]).await.map_err( HardwareError::Serial )
     }
 }
-
 
 
 impl<SPI, CE, IRQ> Drop for Driver<SPI, CE, IRQ> {
