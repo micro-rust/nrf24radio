@@ -26,8 +26,10 @@
 #![no_main]
 
 #![feature(type_alias_impl_trait)]
+#![feature(impl_trait_in_assoc_type)]
 
 
+#![allow(static_mut_refs)]
 
 // Core imports.
 use core::mem::MaybeUninit;
@@ -52,9 +54,6 @@ use embassy_rp::{
 
     peripherals::{
         SPI0, SPI1,
-
-        PIN_4,  PIN_5,  PIN_6,
-        PIN_10, PIN_11, PIN_13,
     },
 
     spi::{
@@ -64,8 +63,9 @@ use embassy_rp::{
 
 // Import the necessary SYNC abstractions.
 use embassy_sync::{
-    mutex::Mutex,
     blocking_mutex::raw::CriticalSectionRawMutex,
+    mutex::Mutex,
+    signal::Signal,
 };
 
 // Import the timer abstractions.
@@ -81,7 +81,7 @@ use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 
 // Import radio.
 use nrf24radio::{
-    Error,
+    Error, RadioPolicy, RXErrorPolicy, TXErrorPolicy,
 
     pipe::{
         RXDataPipe, TXDataPipe,
@@ -100,6 +100,32 @@ static mut SPI0GLOBAL: MaybeUninit<Mutex<CriticalSectionRawMutex, Spi<'static, S
 /// SPI Global for the SPI1 Bus mutex.
 /// This allows multiple tasks to access the SPI bus through `SpiDevice`s.
 static mut SPI1GLOBAL: MaybeUninit<Mutex<CriticalSectionRawMutex, Spi<'static, SPI1, Async>>> = MaybeUninit::uninit();
+
+/// Radio 0 policy control.
+/// This allows to dynamically change the behaviour of the radio.
+static R0BEHAVIOUR: Signal<CriticalSectionRawMutex, RadioPolicy> = Signal::new();
+
+/// Radio 1 policy control.
+/// This allows to dynamically change the behaviour of the radio.
+static R1BEHAVIOUR: Signal<CriticalSectionRawMutex, RadioPolicy> = Signal::new();
+
+/// Size of the packets
+const PACKETSIZE: usize = 64;
+
+/// Report interval of the bitrate.
+const INTERVAL: Duration = Duration::from_secs(4);
+
+
+
+// Create the configuration of the radio.
+// Please note that this configuration MUST be the same as the TX configuration.
+// The only thing that can be different is the gain.
+// If you want this can be made a constant, as all `Config` methods are `const`.
+const RADIOCONFIG: nrf24radio::Config = nrf24radio::Config::new()
+        .channel( 64 )
+        .datarate( nrf24radio::common::DataRate::High )
+        .gain( nrf24radio::common::Gain::High )
+        .crc( nrf24radio::common::CRCBytes::One );
 
 
 
@@ -216,11 +242,9 @@ async fn main(spawner: Spawner) {
 
 // This task will showcase how to handle a RX radio driver.
 #[task]
-async fn rx(spi: SpiDevice<'static, CriticalSectionRawMutex, Spi<'static, SPI1, Async>, Output<'static, PIN_13>>, ce: Output<'static, PIN_11>, irq: Input<'static, PIN_10>, spawner: Spawner) {
+async fn rx(spi: SpiDevice<'static, CriticalSectionRawMutex, Spi<'static, SPI1, Async>, Output<'static>>, ce: Output<'static>, irq: Input<'static>, spawner: Spawner) {
     use nrf24radio::{
-        Config, Driver,
-
-        common::*,
+        Driver,
 
         pipe::{
             DataPipe, RXConfig,
@@ -256,7 +280,7 @@ async fn rx(spi: SpiDevice<'static, CriticalSectionRawMutex, Spi<'static, SPI1, 
     // If you don't use the IRQ pin Rust will complain that it doesn't know the
     // type of the IRQ pin. To get around this, you have to provide a fake pin
     // type (the `Input<'_, PIN_10>` part). The pin number can be any.
-    let mut radio: Driver<_, _, Input<'_, PIN_10>> = match Driver::create(spi, ce, Some(irq), rxpipes, txpipe).await {
+    let mut radio: Driver<_, _, Input<'_>> = match Driver::create(spi, ce, Some(irq), rxpipes, txpipe).await {
         Err(_) => {
             defmt::error!("RX : Failed to create radio driver");
             return;
@@ -267,18 +291,8 @@ async fn rx(spi: SpiDevice<'static, CriticalSectionRawMutex, Spi<'static, SPI1, 
 
     defmt::info!("RX : Created the radio driver");
 
-    // Create the configuration of the radio.
-    // Please note that this configuration MUST be the same as the TX configuration.
-    // The only thing that can be different is the gain.
-    // If you want this can be made a constant, as all `Config` methods are `const`.
-    let config = Config::new()
-        .channel( 0 )
-        .datarate( DataRate::High )
-        .gain( Gain::Max )
-        .crc( CRCBytes::One );
-
     // Write the configuration.
-    if let Err(_) = radio.configure( config ).await {
+    if let Err(_) = radio.configure( RADIOCONFIG ).await {
         defmt::error!("RX : Failed to configure the driver");
         return;
     }
@@ -307,90 +321,25 @@ async fn rx(spi: SpiDevice<'static, CriticalSectionRawMutex, Spi<'static, SPI1, 
         return;
     }
 
-    // Now we have a NRF24 device in an unknown state (probably powered down or on standby).
-    // So we have to wake it.
-    // The NRF24L01 devices need at least 5 ms to go from POWERED DOWN to STANDBY and the driver
-    // does not insert those delays (in order to be executor agnostic) so we have to do those manually.
-    if let Err(_) = radio.standby().await {
-        defmt::error!("RX : Failed to change to STANDBY mode");
-        return;
-    }
+    core::sync::atomic::compiler_fence( core::sync::atomic::Ordering::AcqRel );
 
-    // Now we wait the delay.
-    Timer::after( Duration::from_millis(5) ).await;
+    // Set in RX mode.
+    //radio.rxmode().await;
 
-    // Now that we are in standby mode, we have to move to the listening mode.
-    // This change needs a delay of 130 us.
-    if let Err(_) = radio.rxmode().await {
-        defmt::error!("RX : Failed to change to RX mode");
-        return;
-    }
+    // Set the radio behaviour.
+    R0BEHAVIOUR.signal(RadioPolicy::Receive);
 
-    // Now we wait the delay.
-    Timer::after( Duration::from_micros(130) ).await;
-
-    // Now we start the driver handling loop.
-    loop {
-        // Check for data.
-        // Notice the `wait` boolean flag of the method.
-        // This flag indicates if the driver wants to wait for incoming data or check and return immediately.
-        // WARNING : If the wait flag is set the driver may wait forever if no data arrives.
-        // But, on the other hand, waiting with an IRQ pin available (line 187) the driver will wait on the pin
-        // and the device may go to sleep, reducing opwer consumption and latency to respond to messages.
-        match radio.rxdata( true ).await {
-            // If the radio received no data, or received data in a closed pipe, it will return None.
-            Ok( maybe ) => match maybe {
-                // If there was data received, the driver returns the number of the pipe that received data,
-                // the number of bytes received and if there is more data immediately available to read.
-                Some( (pipe, bytes, more) ) => defmt::trace!("RX : Received {} bytes on pipe {} (pending {})", bytes, pipe, more),
-                _ => (),
-            },
-
-            // If there was an error the driver returns a tuple.
-            // The first element is the driver error (what could not be accomplished)
-            // The second element is the hardware error (the SPI failed, the IRQ failed, the CE failed)
-            // This hardware error may or may not be set, depending on the reason for the first error.
-            Err( (error, _) ) => match error {
-                // RX OVerflow errors must be handled. These errors occur due to errors
-                // in the ShockBurst protocol. For now, clear these manually, in the future
-                // a clear or reset method may be provided.
-                Error::RXOverflow => {
-                    defmt::warn!("RX : Resetting RX device after overflow...");
-
-                    // Set the device to power down. This needs no delay.
-                    while let Err(_) = radio.powerdown().await {}
-
-                    // Perform a RX FIFO flush.
-                    while let Err(_) = radio.command( Command::FlushRX ).await {}
-
-                    // Move to standby.
-                    while let Err(_) = radio.standby().await {}
-
-                    // Wait for 5 milliseconds.
-                    Timer::after( Duration::from_millis( 5 ) ).await;
-
-                    // Move to listen mode.
-                    while let Err(_) = radio.rxmode().await {}
-
-                    // Wait for 130 microseconds.
-                    Timer::after( Duration::from_micros( 130 ) ).await;
-                },
-
-                _ => defmt::error!("RX : Generic driver error"),
-            },
-        }
-    }
+    // Start running the radio driver.
+    radio.run(&R0BEHAVIOUR, RXErrorPolicy::Skip, TXErrorPolicy::Skip).await;
 }
 
 
 
 // This task will showcase how to handle a TX radio driver.
 #[task]
-async fn tx(spi: SpiDevice<'static, CriticalSectionRawMutex, Spi<'static, SPI0, Async>, Output<'static, PIN_4>>, ce: Output<'static, PIN_5>, irq: Input<'static, PIN_6>, spawner: Spawner) {
+async fn tx(spi: SpiDevice<'static, CriticalSectionRawMutex, Spi<'static, SPI0, Async>, Output<'static>>, ce: Output<'static>, irq: Input<'static>, spawner: Spawner) {
     use nrf24radio::{
-        Config, Driver,
-
-        common::*,
+        Driver,
 
         pipe::{
             DataPipe, TXConfig,
@@ -426,7 +375,7 @@ async fn tx(spi: SpiDevice<'static, CriticalSectionRawMutex, Spi<'static, SPI0, 
     // If you don't use the IRQ pin Rust will complain that it doesn't know the
     // type of the IRQ pin. To get around this, you have to provide a fake pin
     // type (the `Input<'_, PIN_10>` part). The pin number can be any.
-    let mut radio: Driver<_, _, Input<'_, PIN_6>> = match Driver::create(spi, ce, Some(irq), rxpipes, txpipe).await {
+    let mut radio: Driver<_, _, Input<'_>> = match Driver::create(spi, ce, Some(irq), rxpipes, txpipe).await {
         Err(_) => {
             defmt::error!("TX : Failed to create radio driver");
             return;
@@ -437,18 +386,8 @@ async fn tx(spi: SpiDevice<'static, CriticalSectionRawMutex, Spi<'static, SPI0, 
 
     defmt::info!("TX : Created the radio driver");
 
-    // Create the configuration of the radio.
-    // Please note that this configuration MUST be the same as the RX configuration.
-    // The only thing that can be different is the gain.
-    // If you want this can be made a constant, as all `Config` methods are `const`.
-    let config = Config::new()
-        .channel( 0 )
-        .datarate( DataRate::High )
-        .gain( Gain::Max )
-        .crc( CRCBytes::One );
-
     // Write the configuration.
-    if let Err(_) = radio.configure( config ).await {
+    if let Err(_) = radio.configure( RADIOCONFIG ).await {
         defmt::error!("TX : Failed to configure the driver");
         return;
     }
@@ -477,62 +416,15 @@ async fn tx(spi: SpiDevice<'static, CriticalSectionRawMutex, Spi<'static, SPI0, 
         return;
     }
 
-    // Now we have a NRF24 device in an unknown state (probably powered down or on standby).
-    // So we have to wake it.
-    // The NRF24L01 devices need at least 5 ms to go from POWERED DOWN to STANDBY and the driver
-    // does not insert those delays (in order to be executor agnostic) so we have to do those manually.
-    if let Err(_) = radio.standby().await {
-        defmt::error!("TX : Failed to change to STANDBY mode");
-        return;
-    }
+    // Set the radio behaviour.
+    R1BEHAVIOUR.signal(RadioPolicy::Transmit);
 
-    // Now we wait the delay.
-    Timer::after( Duration::from_millis(5) ).await;
+    // Set in RX mode.
+    //radio.txmode().await;
 
-    // Now that we are in standby mode, we have to move to the transmitting mode.
-    // This change needs a delay of 130 us.
-    if let Err(_) = radio.txmode().await {
-        defmt::error!("TX : Failed to change to RX mode");
-        return;
-    }
-
-    // Now we wait the delay.
-    Timer::after( Duration::from_micros(130) ).await;
-
-    // Now we start the driver handling loop.
-    loop {
-        // Check for data to transmit.
-        // Notice the `wait` boolean flag of the method.
-        // This flag indicates if the driver wants to wait for outgoing data or check and return immediately.
-        // WARNING : If the wait flag is set the driver may wait forever if no data is sent through the TX pipe.
-        // But, on the other hand, waiting may allow the device to go to sleep, reducing power consumption and
-        // latency to respond to messages.
-        match radio.txdata(true).await {
-            // If the radio found no data to send it will return None.
-            Ok( maybe ) => match maybe {
-                // If it sent data, it will return the number of bytes sent.
-                Some( bytes ) => defmt::debug!("TX : Sent {} bytes", bytes),
-                _ => (),
-            },
-
-            Err( (error, _) ) => match error {
-                // At least 1 packet was lost during transmission after the maximum number of retries.
-                // To fix this, reduce data rate of the config, increase gain, increase retries or retry delay.
-                // All these fixes increase reliability at the cost of data rate.
-                Error::MaxRetries => defmt::error!("TX : Max retries reached"),
-                _ => defmt::error!("TX : Driver error"),
-            },
-        }
-    }
+    // Start running the radio driver.
+    radio.run(&R1BEHAVIOUR, RXErrorPolicy::Skip, TXErrorPolicy::Skip).await;
 }
-
-
-
-/// RX Bitrate measurement flag.
-static mut RXTRIGGER: bool = false;
-
-/// RX Bitrate measurement flag.
-static mut TXTRIGGER: bool = false;
 
 
 
@@ -551,18 +443,12 @@ async fn rxdata(mut pipe: RXDataPipe, spawner: Spawner) {
     // Create the start instant for bitrate measurements.
     let mut start = Instant::now();
 
-    // Spawn the RX trigger task.
-    if let Err(_) = spawner.spawn( trigger( unsafe { &mut RXTRIGGER } ) ) {
-        defmt::error!("RX pipe : Failed to spawn bitrate measurement trigger task");
-        return;
-    }
-
     loop {
-        // Check if it is time to report the bitrate.
-        if unsafe { RXTRIGGER } {
-            // Reset the flag.
-            unsafe { RXTRIGGER = false }
+        // Get the elapsed time.
+        let elapsed = start.elapsed();
 
+        // Check if it is time to report the bitrate.
+        if elapsed > INTERVAL {
             // Get the elapsed time.
             let elapsed = start.elapsed();
 
@@ -613,22 +499,12 @@ async fn txdata(mut pipe: TXDataPipe, spawner: Spawner) {
     defmt::info!("TX Pipe : Hello from the RX pipe task");
 
     // Create the dummy data packets.
-    #[link_section = ".data.RADIOTEST"]
-    static SMALL: [u8; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+    let mut packet = [0; PACKETSIZE];
 
-    #[link_section = ".uninit.RADIOTEST"]
-    static mut BIG: [u8; 65] = [0; 65];
 
-    #[link_section = ".uninit.RADIOTEST"]
-    static mut GIANT: [u8; 4096] = [0; 4096];
-
-    // Initialize the buffers.
-    for byte in unsafe { &mut BIG } {
-        *byte = 0x99;
-    }
-
+    // Initialize the buffer.
     let mut i = 0;
-    for byte in unsafe { &mut GIANT } {
+    for byte in &mut packet {
         // Set the byte.
         *byte = i;
 
@@ -645,21 +521,12 @@ async fn txdata(mut pipe: TXDataPipe, spawner: Spawner) {
     // Create the start instant for bitrate measurements.
     let mut start = Instant::now();
 
-    // Spawn the RX trigger task.
-    if let Err(_) = spawner.spawn( trigger( unsafe { &mut TXTRIGGER } ) ) {
-        defmt::error!("TX pipe : Failed to spawn bitrate measurement trigger task");
-        return;
-    }
-
     loop {
+        // Get the elapsed time.
+        let elapsed = start.elapsed();
+
         // Check if it is time to report the bitrate.
-        if unsafe { TXTRIGGER } {
-            // Reset the flag.
-            unsafe { TXTRIGGER = false }
-
-            // Get the elapsed time.
-            let elapsed = start.elapsed();
-
+        if elapsed > INTERVAL {
             // Measure bytes per second.
             let bps = (bytes as u64 * 1000) / elapsed.as_millis();
 
@@ -674,25 +541,13 @@ async fn txdata(mut pipe: TXDataPipe, spawner: Spawner) {
         // Select here which kind of packet you want to send.
         // This will let you see the effects on bitrate of different buffer sizes.
         // You can also set if you want the receiver to acknowledge the reception of packets.
-        if let Err(_) = pipe.send( unsafe { &GIANT }, false ).await {
-            defmt::error!("TX pipe : Failed to send a packet");
+        if let Err( error ) = pipe.send( &packet, true ).await {
+            //defmt::error!("TX pipe : Failed to send a packet: {}", error);
         }
 
         // Increase the byte counter.
-        bytes += unsafe { GIANT.len() };
-    }
-}
+        bytes += packet.len();
 
-
-
-// Theses are independent tasks that will trigger the bitrate measurements.
-#[task(pool_size = 2)]
-async fn trigger(flag: &'static mut bool) {
-    loop {
-        // Wait 4 seconds.
-        Timer::after( Duration::from_secs(4) ).await;
-
-        // Set the trigger.
-        *flag = true;
+        embassy_futures::yield_now().await;
     }
 }
