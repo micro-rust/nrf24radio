@@ -12,6 +12,7 @@ use super::State;
 
 /// A set of possible usage errors in the driver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "log", derive(defmt::Format))]
 pub enum Error {
     /// The driver could not read the status register.
     CouldNotReadStatus,
@@ -66,6 +67,50 @@ pub enum Error {
     UnknownPayloadWidth,
 }
 
+/*
+#[cfg(feature = "log")]
+impl defmt::Format for Error {
+    fn format(&self, _: defmt::Formatter) {
+        // String to format.
+        let string = match self {
+            Error::CouldNotReadStatus => defmt::intern!("Could not read device status"),
+            Error::FailedDriverCreation => defmt::intern!("Failed to create radio driver"),
+            Error::FailedDriverConfiguration => defmt::intern!("Failed to set driver configuration"),
+            Error::FailedModeSet( state ) => match state {
+                State::PowerDown => defmt::intern!("Failed to set radio to PowerDown"),
+                State::Standby => defmt::intern!("Failed to set radio to Standby"),
+                State::Transmitting => defmt::intern!("Failed to set radio to Transmit"),
+                State::Receiving => defmt::intern!("Failed to set radio to Receive"),
+            },
+            Error::FailedPacketDownload => defmt::intern!("Failed to download a packet from the radio FIFO"),
+            Error::FailedPacketUpload => defmt::intern!("Failed to upload a packet to the radio FIFO"),
+            Error::FailedRegisterWrite => defmt::intern!("Failed to write to a register"),
+            Error::IllegalPipeNumber( _ ) => defmt::intern!("Illegal pipe number found {=u8}"),
+            Error::MaxRetries => defmt::intern!("Maximum retries reached while transmitting"),
+            Error::Orphaned => defmt::intern!("A driver pipe was orphaned"),
+            Error::PipeClosed => defmt::intern!("A driver pipe was closed"),
+            Error::PipeCurrentlyUsed => defmt::intern!("The requested driver pipe is already in use"),
+            Error::PipeNotAvailable => defmt::intern!("The requested driver pipe is not available"),
+            Error::RXOverflow => defmt::intern!("Overflow in a RX pipe"),
+            Error::RXPipeCreationFailed( _ ) => defmt::intern!("Failed to create RX pipe {=u8}"),
+            Error::TXPipeCreationFailed => defmt::intern!("Failed to create a TX pipe"),
+            Error::UnknownPayloadWidth => defmt::intern!("Unexpected payload width in a received packet"),
+        };
+
+        // Send the defmt string.
+        defmt::export::istr(&string);
+
+        // Check if the error needs additional data.
+        match self {
+            Error::IllegalPipeNumber( n ) => defmt::export::u8(n),
+            Error::RXPipeCreationFailed( n ) => defmt::export::u8(n),
+
+            _ => (),
+        }
+    }
+}
+*/
+
 
 
 /// A set of possible hardware errors in the driver.
@@ -78,4 +123,19 @@ pub enum HardwareError<SPI, CE, IRQ> {
 
     /// An error with the CE pin.
     ChipEnable( CE ),
+}
+
+#[cfg(feature = "log")]
+impl<SPI, CE, IRQ> defmt::Format for HardwareError<SPI, CE, IRQ> {
+    fn format(&self, _: defmt::Formatter) {
+        // String to format.
+        let string = match self {
+            HardwareError::Serial( _ ) => defmt::intern!("SPI Serial Error"),
+            HardwareError::Interrupt( _ ) => defmt::intern!("Interrupt Error"),
+            HardwareError::ChipEnable( _ ) => defmt::intern!("Digital IO Error"),
+        };
+
+        // Send the defmt string.
+        defmt::export::istr(&string);
+    }
 }

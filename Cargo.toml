@@ -29,10 +29,23 @@ version = "^1.0.0-rc.1"
 optional = true
 version = "0.3"
 
+[dependencies.embassy-sync]
+optional = true
+version = "0.5"
+git = "https://github.com/embassy-rs/embassy"
+
+[dependencies.embassy-futures]
+optional = true
+version = "0.1"
+git = "https://github.com/embassy-rs/embassy"
+
 
 
 [features]
 
-default = ["log"]
+default = ["log", "control-loop"]
 
-log = ["defmt"]
+# Enables logging
+log = ["dep:defmt"]
+
+control-loop = ["dep:embassy-sync", "dep:embassy-futures"]

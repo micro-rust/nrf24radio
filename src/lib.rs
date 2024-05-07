@@ -25,6 +25,10 @@ mod config;
 mod error;
 mod state;
 
+#[cfg(feature = "control-loop")]
+mod control;
+
+
 
 
 pub use config::*;
@@ -32,6 +36,9 @@ pub use config::*;
 pub use error::*;
 
 pub use state::*;
+
+#[cfg(feature = "control-loop")]
+pub use control::*;
 
 
 
@@ -44,12 +51,29 @@ use embedded_hal_async::{
     spi::SpiDevice,
 };
 
+#[cfg(feature = "control-loop")]
+use embassy_sync::{
+    blocking_mutex::raw::RawMutex,
+    signal::Signal,
+};
+
+#[cfg(feature = "control-loop")]
+use embassy_futures::select::{
+    select, select3,
+    
+    Either, Either3,
+};
+
+#[cfg(feature = "control-loop")]
+use pipe::Watcher;
+
 
 
 /// Global garbage buffer.
 /// This buffer is used by all drivers to dump garbage data or flush caches.
 /// Data races don't matter because this is garbage data.
 #[link_section = ".uninit.NRF24RADIO.scratch"]
+#[used]
 static mut SCRATCH: [u8; 33] = [0u8; 33];
 
 
@@ -88,10 +112,12 @@ pub struct Driver<SPI, CE, IRQ> {
     txpipe: &'static mut pipe::DataPipe,
 }
 
-
 /// Common high level method for general use of NRF24L01(+) devices.
-/// Creating / Configuring the driver.
+/// Creating / Configuring the driver and control loop.
 impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
+    /// Hardware error type emitted by this driver.
+    pub type HWError = HardwareError<SPI::Error, CE::Error, IRQ::Error>;
+
     /// Common error type emitted by this driver.
     pub type Error = (Error, Option<HardwareError<SPI::Error, CE::Error, IRQ::Error>>);
 
@@ -129,6 +155,7 @@ impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
     }
 
     /// Configures the nRF24L01(+) device driver.
+    /// If `validate` is set, the register writes will be validated.
     pub async fn configure(&mut self, config: Config) -> Result<(), Self::Error> {
         // Set to at least standby.
         if (self.state == State::Transmitting) || (self.state == State::Receiving) {
@@ -225,6 +252,245 @@ impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
         Ok( () )
     }
 }
+
+#[cfg(feature = "control-loop")]
+impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
+    pub async fn run<M: RawMutex>(&mut self, policy: &'static Signal<M, RadioPolicy>, rxfail: RXErrorPolicy, txfail: TXErrorPolicy) {
+        // Internal enum to validate actions.
+        // This is created to reduce the state machine size.
+        #[derive(Clone, Copy, Eq, PartialEq)]
+        enum Action { Recv, Send, Change( RadioPolicy ), None, }
+
+        // Current radio behaviour.
+        let mut current = RadioPolicy::PowerDown;
+
+        loop {
+            // Update the policy if necessary.
+            if policy.signaled() {
+                current = policy.wait().await;
+            }
+
+            // Check for the passive modes.
+            if (current == RadioPolicy::PowerDown) || (current == RadioPolicy::Standby) {
+                // Set power down mode if necessary.
+                if current == RadioPolicy::PowerDown {
+                    let _ = self.powerdown().await;
+                }
+
+                // Set standby mode if necessary.
+                if current == RadioPolicy::Standby {
+                    let _ = self.standby().await;
+                }
+
+                // Wait until the policy changes.
+                current = policy.wait().await;
+            }
+
+            // Set the RX mode if necessary.
+            if (current == RadioPolicy::Receive) || (current == RadioPolicy::ReceiveUntilTransmit) {
+                let _ = self.rxmode().await;
+                //defmt::warn!("Ready to check for data");
+            }
+
+            // Check the active modes.
+            let action = match current {
+                // Handle the receive policy.
+                RadioPolicy::Receive => match select( policy.wait(), status::<_, CE, _>(&mut self.irq, &mut self.spi) ).await {
+                    // Radio policy changed.
+                    Either::First(new) => Action::Change( new ),
+
+                    // There is data available to receive.
+                    Either::Second(result) => match result {
+                        Err(error) => {
+                            // Handle the error.
+                            current = self.rxerror(error, current, rxfail);
+
+                            // Do nothing.
+                            Action::None
+                        },
+
+                        Ok(status) => {
+                            //defmt::warn!("Status of RX driver: {:b}", status);
+
+                            match (status >> 6) & 1 {
+                                0 => Action::None,
+                                _ => Action::Recv,
+                            }
+                        },
+                    },
+                },
+
+                // Handle the receive until transmit policy.
+                RadioPolicy::ReceiveUntilTransmit => match select3( policy.wait(), status::<_, CE, _>(&mut self.irq, &mut self.spi), Watcher::new( self.txpipe, BufferState::Ready ) ).await {
+                    // Radio policy changed.
+                    Either3::First(new) => Action::Change( new ),
+
+                    // There is data available to receive.
+                    Either3::Second(_) => Action::Recv,
+
+                    // There is data available to send.
+                    Either3::Third(_) => Action::Send,
+                },
+
+                // Handle the transmit policy.
+                RadioPolicy::Transmit => match select( policy.wait(), Watcher::new( self.txpipe, BufferState::Ready ) ).await {
+                    // Radio policy changed.
+                    Either::First(new) => Action::Change( new ),
+
+                    // There is data available to send.
+                    Either::Second(_) => Action::Send,
+                },
+
+                _ => Action::None,
+            };
+
+            // Check which action to perform.
+            match action {
+                Action::Change( new ) => current = new,
+
+                Action::Recv => {
+                    // Ensure we are in TX mode.
+                    let _ = self.rxmode().await;
+
+                    // Send the data.
+                    match self.rxdata(true).await {
+                        Err(error) => {
+                            // Handle the error.
+                            current = self.rxerror(error, current, rxfail);
+                        },
+
+                        Ok(Some((pipe, bytes, more))) => defmt::debug!("RX Driver: Received {} bytes on pipe {} [more = {}]", bytes, pipe, more),
+
+                        Ok(None) => defmt::debug!("RX Driver: Expected data but no data was available"),
+                    }
+                },
+
+                // Send a packet.
+                Action::Send => {
+                    // Ensure we are in TX mode.
+                    let _ = self.txmode().await;
+
+                    // Send the data.
+                    if let Err(error) = self.txdata(true).await {
+                        // Handle the error.
+                        current = self.txerror(error, current, txfail);
+                    }
+                },
+
+                Action::None => (),
+            }
+        }
+
+        // Yield to allow other tasks to run.
+        embassy_futures::yield_now().await;
+    }
+
+    /// Handles the RX errors.
+    fn rxerror(&mut self, (error, hw): Self::Error, policy: RadioPolicy, rxfail: RXErrorPolicy) -> RadioPolicy {
+        // Log the error.
+        #[cfg(feature = "log")]
+        match hw {
+            Some( hw ) => defmt::error!("RX Driver Error: {} [{}]", error, hw),
+            None => defmt::error!("RX Driver Error: {}", error),
+        }
+
+        // Check behaviour after error.
+        match rxfail {
+            // Power down the radio.
+            RXErrorPolicy::PowerDown => RadioPolicy::PowerDown,
+
+            // Standby the radio.
+            RXErrorPolicy::Standby => RadioPolicy::Standby,
+
+            _ => policy,
+        }
+    }
+
+    /// Handles the RX errors.
+    fn txerror(&mut self, (error, hw): Self::Error, policy: RadioPolicy, txfail: TXErrorPolicy) -> RadioPolicy {
+        // Log the error.
+        /*
+        #[cfg(feature = "log")]
+        match hw {
+            Some( hw ) => defmt::error!("TX Driver Error: {} [{}]", error, hw),
+            None => defmt::error!("TX Driver Error: {}", error),
+        }
+        */
+
+        // Check behaviour after error.
+        match txfail {
+            // Power down the radio.
+            TXErrorPolicy::PowerDown => RadioPolicy::PowerDown,
+
+            // Standby the radio.
+            TXErrorPolicy::Standby => RadioPolicy::Standby,
+
+            // Check if it's a max retries error.
+            TXErrorPolicy::SkipUnlessMaxRetries if error == Error::MaxRetries => {
+                RadioPolicy::Standby
+            },
+
+            _ => policy,
+        }
+    }
+
+    #[cfg(feature = "log")]
+    pub async fn report(&mut self) {
+        // Read the registers.
+        let regs = [
+            self.readreg(0x00).await.unwrap_or(0xFF),
+            self.readreg(0x01).await.unwrap_or(0xFF),
+            self.readreg(0x02).await.unwrap_or(0xFF),
+            self.readreg(0x03).await.unwrap_or(0xFF),
+            self.readreg(0x04).await.unwrap_or(0xFF),
+            self.readreg(0x05).await.unwrap_or(0xFF),
+            self.readreg(0x06).await.unwrap_or(0xFF),
+            self.readreg(0x07).await.unwrap_or(0xFF),
+            self.readreg(0x08).await.unwrap_or(0xFF),
+            self.readreg(0x09).await.unwrap_or(0xFF),
+
+            self.readreg(0x11).await.unwrap_or(0xFF),
+            self.readreg(0x12).await.unwrap_or(0xFF),
+            self.readreg(0x13).await.unwrap_or(0xFF),
+            self.readreg(0x14).await.unwrap_or(0xFF),
+            self.readreg(0x15).await.unwrap_or(0xFF),
+            self.readreg(0x16).await.unwrap_or(0xFF),
+
+            self.readreg(0x17).await.unwrap_or(0xFF),
+            self.readreg(0x1C).await.unwrap_or(0xFF),
+            self.readreg(0x1D).await.unwrap_or(0xFF),
+        ];
+
+        let names = [
+            "Config",
+            "Enable Auto Acknowledge",
+            "Enable RX Address",
+            "Setup Address Width",
+            "Setup Retries",
+            "RF Channel",
+            "RF Setup",
+            "Status",
+            "Observe TX",
+            "Power Detect",
+
+            "Bytes in Pipe 0",
+            "Bytes in Pipe 1",
+            "Bytes in Pipe 2",
+            "Bytes in Pipe 3",
+            "Bytes in Pipe 4",
+            "Bytes in Pipe 5",
+
+            "FIFO Status",
+            "Dynamic Payload",
+            "Features",
+        ];
+
+        for (r, n) in regs.iter().zip(names.iter()) {
+            defmt::info!("Register {}: {:b}", n, r)
+        }
+    }
+}
+
 
 
 /// High level methods to use the RX interface of NRF24L01(+) devices.
@@ -369,7 +635,7 @@ impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
         // If pipe number is bigger than 5 recheck the number.
         if npipe > 5 {
             #[cfg(feature = "log")]
-            defmt::warn!("RX Driver : Illegal pipe number. Reading again...");
+            defmt::warn!("RX Driver : Illegal pipe number ({}). Reading again...", npipe);
 
             // Reread status and validate.
             status = self.status(false).await?;
@@ -380,7 +646,7 @@ impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
             // If the pipe number is wrong again abort.
             if npipe > 5 {
                 #[cfg(feature = "log")]
-                defmt::error!("RX Driver : Illegal pipe number");
+                defmt::error!("RX Driver : Illegal pipe number ({})", npipe);
 
                 // Clear the IRQ.
                 let _ = self.clearirqs().await;
@@ -534,6 +800,9 @@ impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
         // Check that the TX pipe is open.
         if self.txpipe.closed() { return Err( ( Error::PipeClosed, None ) ) }
 
+        #[cfg(feature = "log")]
+        defmt::trace!("TX Driver : Checking for new data");
+
         // Check for data in the TX pipe.
         match self.txpipe.bufstate {
             // Wait for data to send.
@@ -547,6 +816,9 @@ impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
             // There is data to send.
             BufferState::Ready => (),
         }
+
+        #[cfg(feature = "log")]
+        defmt::trace!("TX Driver : Found data in the pipe");
 
         // Set the TX command.
         self.txpipe.buf[0] = if self.txpipe.ack { Command::WritePayload as u8 } else { Command::WritePayloadNoAck as u8 };
@@ -576,6 +848,9 @@ impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
 
             // Read the status registers.
             if let Ok( [status, fifo] ) = self.statuses(!first).await {
+                #[cfg(feature = "log")]
+                defmt::debug!("TX Driver : Status while uploading {:b}", status);
+
                 // Check for a retry error.
                 if (status & (1 << 4)) != 0 { break (Error::MaxRetries, None) }
 
@@ -750,7 +1025,7 @@ impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
     }
 
     /// Clears the given IRQs from the status register.
-    pub async fn clearirq(&mut self, rxdr: bool, txds: bool, retries: bool) -> Result<(), HardwareError<SPI::Error, CE::Error, IRQ::Error>> {
+    pub async fn clearirq(&mut self, rxdr: bool, txds: bool, retries: bool) -> Result<(), Self::HWError> {
         // Build the IRQ clear byte.
         let mut irq = 0;
 
@@ -763,12 +1038,12 @@ impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
     }
 
     /// Clears all IRQs from the status register.
-    pub async fn clearirqs(&mut self) -> Result<(), HardwareError<SPI::Error, CE::Error, IRQ::Error>> {
+    pub async fn clearirqs(&mut self) -> Result<(), Self::HWError> {
         self.writereg(Register::Status, 0b111 << 4).await
     }
 
     /// Reads the payload width of the top level FIFO packet.
-    pub async fn pldwidth(&mut self) -> Result<u8, HardwareError<SPI::Error, CE::Error, IRQ::Error>> {
+    pub async fn pldwidth(&mut self) -> Result<u8, Self::HWError> {
         // Create the read buffer.
         let mut read = [0; 2];
 
@@ -1002,12 +1277,12 @@ impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
 impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
     /// Low level function to write a buffer to the device.
     /// This function correlates to the `write` SPI function.
-    pub async fn writebuf(&mut self, buf: &[u8]) -> Result<(), HardwareError<SPI::Error, CE::Error, IRQ::Error>> {
+    pub async fn writebuf(&mut self, buf: &[u8]) -> Result<(), Self::HWError> {
         self.spi.write(buf).await.map_err( HardwareError::Serial )
     }
 
     /// Low level function to write to a register.
-    pub async fn writereg<R: Into<u8>>(&mut self, r: R, v: u8) -> Result<(), HardwareError<SPI::Error, CE::Error, IRQ::Error>> {
+    pub async fn writereg<R: Into<u8>>(&mut self, r: R, v: u8) -> Result<(), Self::HWError> {
         // Create the command buffer.
         let buf = [(1 << 5) | r.into(), v];
 
@@ -1016,7 +1291,7 @@ impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
     }
 
     /// Low level function to read a register.
-    pub async fn readreg<R: Into<u8>>(&mut self, r: R) -> Result<u8, HardwareError<SPI::Error, CE::Error, IRQ::Error>> {
+    pub async fn readreg<R: Into<u8>>(&mut self, r: R) -> Result<u8, Self::HWError> {
         // Create the command buffer.
         let write = [r.into(), 0x00];
 
@@ -1030,7 +1305,7 @@ impl<SPI: SpiDevice, CE: OutputPin, IRQ: Wait> Driver<SPI, CE, IRQ> {
     }
 
     /// Low level function to send a 1 byte command.
-    pub async fn command(&mut self, c: Command) -> Result<(), HardwareError<SPI::Error, CE::Error, IRQ::Error>> {
+    pub async fn command(&mut self, c: Command) -> Result<(), Self::HWError> {
         self.spi.write(&[c.into()]).await.map_err( HardwareError::Serial )
     }
 }
@@ -1045,4 +1320,27 @@ impl<SPI, CE, IRQ> Drop for Driver<SPI, CE, IRQ> {
             pipe.driver = DriverState::Orphaned;
         }
     }
+}
+
+
+
+/// External closure to read the status register.
+/// Needed to avoid compiler complaints.
+async fn status<SPI: SpiDevice, CE: OutputPin, IRQ: Wait>(irq: &mut Option<IRQ>, spi: &mut SPI) -> Result<u8, (Error, Option<HardwareError<SPI::Error, CE::Error, IRQ::Error>>)> {
+    // Wait if the flag is set and IRQ pin is available.
+    if let Some(ref mut irq) = irq {
+        if let Err( hwe ) = irq.wait_for_low().await.map_err( HardwareError::Interrupt ) {
+            return Err( ( Error::CouldNotReadStatus, Some(hwe) ) );
+        }
+    }
+
+    // RX buffer.
+    let mut read = [0u8];
+    
+    // Perform the SPI transfer.
+    if let Err( hwe ) = spi.transfer(&mut read, &[0xFF]).await {
+        return Err( ( Error::CouldNotReadStatus, Some( HardwareError::Serial(hwe) ) ) );
+    }
+    
+    Ok( read[0] )    
 }

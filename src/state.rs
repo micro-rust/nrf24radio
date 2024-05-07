@@ -19,3 +19,19 @@ pub enum State {
     /// The device is receiving data or ready to receive data.
     Receiving,
 }
+
+#[cfg(feature = "log")]
+impl defmt::Format for State {
+    fn format(&self, _: defmt::Formatter) {
+        // String to format.
+        let string = match self {
+            State::PowerDown => defmt::intern!("Power Down"),
+            State::Standby => defmt::intern!("Standby"),
+            State::Transmitting => defmt::intern!("Transmitting"),
+            State::Receiving => defmt::intern!("Receiving"),
+        };
+
+        // Send the defmt string.
+        defmt::export::istr(&string);
+    }
+}
